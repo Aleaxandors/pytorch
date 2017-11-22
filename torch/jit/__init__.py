@@ -4,7 +4,7 @@ from torch import Tensor
 from torch.autograd import Variable
 from torch.nn import Module, ParameterList, Parameter
 from torch._six import raise_from
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import warnings
 import itertools
 import types
@@ -109,32 +109,6 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
     """
     def _compile(arg):
         if inspect.isclass(arg):
-            class CompiledModuleMeta(type):
-                def __call__(cls, *args, **kwargs):
-                    # NOTE: this is called whenever an instance of this class is created
-                    # The super call below will call __new__ and __init__, and we will
-                    # patch things later.
-                    try:
-                        obj = super(CompiledModuleMeta, cls).__call__(*args, **kwargs)
-                    except TypeError as e:
-                        # If this fails here, the user probably didn't use this as a class decorator
-                        if "super" in str(e):
-                            raise_from(TypeError("torch.jit.compile must be used as a class decorator; "
-                                                 "using it on an already defined class is not valid."
-                                                 "\n\nOriginal error: {}".format(str(e))), e)
-                        else:
-                            raise
-
-                    compiled_fn = torch._C.CompiledFunction(nderivs, optimize,
-                                                            obj.forward,
-                                                            arg.__name__)
-                    compiled_fn.enabled = enabled
-                    obj.compiled_fn = compiled_fn
-                    obj.forward = lambda *args: compiled_fn(args, list(obj.parameters()))
-                    obj.has_trace_for = lambda *args: compiled_fn.has_trace_for(args, list(obj.parameters()))
-                    obj.graph_for = lambda *args: compiled_fn.graph_for(args, list(obj.parameters()))
-                    return obj
-
             # NB: It might seem natural to create a subclass here, rather than
             # make a copy of the class to insert the mixin.  Unfortunately, this
             # will break many user classes.  Suppose you have:
@@ -155,9 +129,37 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
             # user passed in), this problem goes away, because the class
             # __init__ is a part of is indeed Foo.
 
+            old_init = arg.__init__
+
+            def __init__(self, *args, **kwargs):
+                torch._C.CompiledFunction.__init__(self,
+                                                   nderivs, optimize, enabled,
+                                                   self.forward,
+                                                   lambda: list(self.parameters()),
+                                                   arg.__name__)
+                try:
+                    old_init(self, *args, **kwargs)
+                except TypeError as e:
+                    # If this fails here, the user probably didn't use this as a class decorator
+                    if "super" in str(e):
+                        raise_from(TypeError("torch.jit.compile must be used as a class decorator; "
+                                             "using it on an already defined class is not valid."
+                                             "\n\nOriginal error: {}".format(str(e))), e)
+                    else:
+                        raise
+                # NOTE: This can't be done in CompiledFunction constructor,
+                # because self.parameters() isn't well defined by then
+                # (Module constructor hasn't run yet).
+                self.update_captured_vars()
+
+            new_dict = dict(arg.__dict__)
+            new_dict['__init__'] = __init__
+            new_dict['__call__'] = torch._C.CompiledFunction.__call__
+            # NOTE: we don't need to override casting methods, because we only capture
+            # parameters, and they mutate their data in-place.
             return type(arg.__name__,
-                        (torch._six.with_metaclass(CompiledModuleMeta, *arg.__bases__),),
-                        dict(arg.__dict__))
+                        arg.__bases__ + (torch._C.CompiledFunction,),
+                        new_dict)
         elif isinstance(arg, Module):
             # It requires work to compile module instances, because you would
             # like the resulting compiled module to look just like the uncompiled
@@ -166,8 +168,9 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
             raise TypeError("Compiling model instances is not supported.  "
                             "Use @torch.jit.compile on a class instead.")
         elif callable(arg):
-            module = type(arg.__name__, (torch.nn.Module,), {'forward': lambda self, *args: arg(*args)})
-            return _compile(module)()
+            compiled_fn = torch._C.CompiledFunction(nderivs, optimize, enabled,
+                                                    arg, None, arg.__name__)
+            return compiled_fn
         else:
             raise TypeError("Cannot handle arg with type {}".format(type(arg)))
     # Make empty parenthesis optional
@@ -325,19 +328,22 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
 
     # TODO: Consider adding a utility function to torch.jit to test
     # for this case
-    if not hasattr(model, 'compiled_fn') or not isinstance(model.compiled_fn, torch._C.CompiledFunction):
+    if not isinstance(model, torch._C.CompiledFunction):
         raise TypeError("Cannot verify an uncompiled module.  Add @torch.jit.compile to compile it")
+    is_module = isinstance(model, Module)
 
     if not isinstance(args, tuple):
         args = (args,)
 
     saved_args = _clone_inputs(args)
-    saved_state = copy.deepcopy(model.state_dict())
+    if is_module:
+        saved_state = copy.deepcopy(model.state_dict())
 
     def run_fwd_bwd(args, force_trace=False, assert_compiled=False):
-        in_vars = _flatten((args, list(model.parameters())))
+        params = list(model.parameters()) if is_module else []
+        in_vars = _flatten((args, params))
         # We use a special API to reset the trace and compile it from scratch.
-        compiled_fn = model.compiled_fn
+        compiled_fn = model
         if force_trace:
             compiled_fn.clear_cache()
         if assert_compiled:
@@ -362,7 +368,8 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
         uncompiled_outs, uncompiled_grads = run_fwd_bwd(args, force_trace=True)
         assert model.has_trace_for(*args)
 
-    model.load_state_dict(saved_state)
+    if is_module:
+        model.load_state_dict(saved_state)
     compiled_outs, compiled_grads = run_fwd_bwd(args, assert_compiled=True)
 
     _verify_equal(uncompiled_outs, compiled_outs)
