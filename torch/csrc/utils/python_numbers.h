@@ -3,16 +3,35 @@
 #include <Python.h>
 #include <stdint.h>
 
+#include <limits>
+
 // largest integer that can be represented consecutively in a double
 const int64_t DOUBLE_INT_MAX = 9007199254740992;
 
 inline PyObject* THPUtils_packInt64(int64_t value) {
+  using lll = std::numeric_limits<long long>;
+  using i64l = std::numeric_limits<int64_t>;
+  static_assert(lll::max() == i64l::max() && lll::min() == i64l::min(),
+                "packInt64 may silently over/underflow");
 #if PY_MAJOR_VERSION == 2
   if (value <= INT32_MAX && value >= INT32_MIN) {
     return PyInt_FromLong(static_cast<long>(value));
   }
 #endif
   return PyLong_FromLongLong(value);
+}
+
+inline PyObject* THPUtils_packUInt64(uint64_t value) {
+  using ulll = std::numeric_limits<unsigned long long>;
+  using ui64l = std::numeric_limits<uint64_t>;
+  static_assert(ulll::max() == ui64l::max() && ulll::min() == ui64l::min(),
+                "packUInt64 may silently over/underflow");
+#if PY_MAJOR_VERSION == 2
+  if (value <= static_cast<uint64_t>(LONG_MAX)) {
+    return PyInt_FromLong(static_cast<long>(value));
+  }
+#endif
+  return PyLong_FromUnsignedLongLong(value);
 }
 
 inline bool THPUtils_checkLong(PyObject* obj) {
